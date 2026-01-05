@@ -141,8 +141,17 @@ function binary_benchmark(num_cycles)
         pass == 1 && @info "random data" entropy symbol_1_probability(src) (sum(source_bits)/length(source_bits))
 
         if pass == 1
-          @warn "skipping static bit model test"
-          continue
+          FastAC.set_probability_0!(static_model, symbol_0_probability(src))
+
+          # encode bit buffer
+          start_encoder!(codec)
+          foreach(bit -> encode!(codec, UInt32(bit), static_model), source_bits)
+          code_bits = 8 * stop_encoder!(codec)
+
+          # decode bit buffer
+          start_decoder!(codec)
+          foreach(ind -> decoded_bits[ind] = decode!(codec, static_model), eachindex(decoded_bits))
+          stop_decoder!(codec)
         else
           @warn "skipping adaptive bit model test"
           continue
