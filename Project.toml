@@ -1,0 +1,4 @@
+name = "FastAC"
+uuid = "67b5c193-ac72-459a-8260-cf84d97d02cd"
+version = "0.1.0"
+authors = ["Manuel F. Schmid <mfs2173@columbia.edu>"]
