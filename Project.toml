@@ -2,3 +2,12 @@ name = "FastAC"
 uuid = "67b5c193-ac72-459a-8260-cf84d97d02cd"
 version = "0.1.0"
 authors = ["Manuel F. Schmid <mfs2173@columbia.edu>"]
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[compat]
+Test = "1.11.0"
+
+[targets]
+test = ["Test"]
