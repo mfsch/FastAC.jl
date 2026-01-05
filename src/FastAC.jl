@@ -105,10 +105,10 @@ mutable struct AdaptiveBitModel
   bit_0_count::UInt32
   bit_count::UInt32
 
-  AdaptiveBitModel() = new(
+  AdaptiveBitModel() = reset!(new(
     ntuple(_ -> zero(UInt32), 2)...,
     ntuple(_ -> zero(UInt32), 3)...,
-  )
+  ))
 
 end
 
@@ -116,12 +116,34 @@ end
 Reset to equiprobable model
 """
 function reset!(this::AdaptiveBitModel)
-  error("not implemented")
+  # initialization to equiprobable model
+  this.bit_0_count = 1
+  this.bit_count   = 2
+  this.bit_0_prob  = 1 << (BM_LENGTH_SHIFT - 1)
+  this.update_cycle = this.bits_until_update = 4 # start with frequent updates
   this
 end
 
 function update!(this::AdaptiveBitModel)
-  error("not implemented")
+
+  # halve counts when a threshold is reached
+  if (this.bit_count += this.update_cycle) > (one(UInt32) << BM_LENGTH_SHIFT)
+    this.bit_count = (this.bit_count + one(UInt32)) >> 1
+    this.bit_0_count = (this.bit_0_count + one(UInt32)) >> 1
+    this.bit_0_count == this.bit_count && (this.bit_count += one(UInt32))
+  end
+
+  # compute scaled bit 0 probability
+  scale::UInt32 = div(0x80000000, this.bit_count)
+  this.bit_0_prob = (this.bit_0_count * scale) >> (31 - BM_LENGTH_SHIFT)
+
+  # set frequency of model updates
+  this.update_cycle = (UInt32(5) * this.update_cycle) >> 2
+  if this.update_cycle > 64
+    this.update_cycle = 64
+  end
+  this.bits_until_update = this.update_cycle
+
   this
 end
 
@@ -388,14 +410,49 @@ function decode!(this::ArithmeticCodec, ::StaticDataModel)::UInt32
   zero(UInt32)
 end
 
-function encode!(this::ArithmeticCodec, bit::UInt32, ::AdaptiveBitModel)
-  error("not implemented")
+function encode!(this::ArithmeticCodec, bit::UInt32, M::AdaptiveBitModel)
+  DEBUG && this.mode != 1 && error("encoder not initialized")
+
+  x::UInt32 = M.bit_0_prob * (this.length >> BM_LENGTH_SHIFT) # product l x p0
+
+  # update interval
+  if iszero(bit)
+    this.length = x
+    M.bit_0_count += 1
+  else
+    init_base::UInt32 = this.base
+    this.base   += x
+    this.length -= x
+    init_base > this.base && propagate_carry!(this) # overflow = carry
+  end
+
+  this.length < AC_MIN_LENGTH && renorm_enc_interval!(this) # renormalization
+
+  iszero(M.bits_until_update -= 1) && update!(M) # periodic model update
+
   this
 end
 
-function decode!(this::ArithmeticCodec, ::AdaptiveBitModel)::UInt32
-  error("not implemented")
-  zero(UInt32)
+function decode!(this::ArithmeticCodec, M::AdaptiveBitModel)::UInt32
+  DEBUG && this.mode != 2 && error("decoder not initialized")
+
+  x::UInt32 = M.bit_0_prob * (this.length >> BM_LENGTH_SHIFT) # product l x p0
+  bit::UInt32 = (this.value >= x) # decision
+
+  # update interval
+  if iszero(bit)
+    this.length = x
+    M.bit_0_count += 1
+  else
+    this.value  -= x
+    this.length -= x
+  end
+
+  this.length < AC_MIN_LENGTH && renorm_dec_interval!(this) # renormalization
+
+  iszero(M.bits_until_update -= 1) && update!(M) # periodic model update
+
+  bit # return data bit value
 end
 
 function encode!(this::ArithmeticCodec, data::UInt32, ::AdaptiveDataModel)
