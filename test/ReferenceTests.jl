@@ -385,6 +385,9 @@ function binary_benchmark(num_cycles)
           foreach(bit -> encode!(codec, UInt32(bit), static_model), source_bits)
           code_bits = 8 * stop_encoder!(codec)
 
+          # check that the compressed size is <1% away from the optimal size
+          @test 0.99 < entropy / (code_bits / SIMUL_TESTS) <= 1.01
+
           # decode bit buffer
           start_decoder!(codec)
           foreach(ind -> decoded_bits[ind] = decode!(codec, static_model), eachindex(decoded_bits))
@@ -397,6 +400,9 @@ function binary_benchmark(num_cycles)
           start_encoder!(codec)
           foreach(bit -> encode!(codec, UInt32(bit), adaptive_model), source_bits)
           code_bits = 8 * stop_encoder!(codec)
+
+          # check that the compressed size is <2% away from the optimal size
+          @test 0.98 < entropy / (code_bits / SIMUL_TESTS) <= 1.02
 
           # decode bit buffer
           reset!(adaptive_model)
@@ -463,6 +469,9 @@ function general_benchmark(data_symbols, num_cycles)
           foreach(x -> encode!(codec, UInt32(x), static_model), source_data)
           code_bits = 8 * stop_encoder!(codec)
 
+          # check that the compressed size is <1% away from the optimal size
+          @test 0.99 < entropy / (code_bits / SIMUL_TESTS) <= 1.01
+
           # decode data buffer
           start_decoder!(codec)
           foreach(ind -> decoded_data[ind] = decode!(codec, static_model), eachindex(decoded_data))
@@ -476,6 +485,9 @@ function general_benchmark(data_symbols, num_cycles)
           start_encoder!(codec)
           foreach(x -> encode!(codec, UInt32(x), adaptive_model), source_data)
           code_bits = 8 * stop_encoder!(codec)
+
+          # check that the compressed size is <1% away from the optimal size
+          @test 0.99 < entropy / (code_bits / SIMUL_TESTS) <= 1.01
 
           reset!(adaptive_model)
 
