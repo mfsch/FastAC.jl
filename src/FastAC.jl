@@ -80,12 +80,65 @@ mutable struct StaticDataModel
 
 end
 
-function model_symbols(this::StaticDataModel)::UInt32
-  this.data_symbols
-end
+model_symbols(this::StaticDataModel)::UInt32 = this.data_symbols
 
-function set_distribution!(this::StaticDataModel, number_of_symbols::UInt32,
-    probability::Union{Nothing,Vector{Float64}} = nothing) # `nothing` means uniform
+function set_distribution!(
+  this::StaticDataModel,
+  number_of_symbols::UInt32,
+  probability::Union{Nothing,Vector{Float64}} = nothing, # `nothing` means uniform
+)
+  2 <= number_of_symbols <= (1 << 11) || error("invalid number of data symbols")
+
+  # assign memory for data model
+  if this.data_symbols != number_of_symbols
+    this.data_symbols = number_of_symbols
+    this.last_symbol = this.data_symbols - 1
+
+    # define size of table for fast decoding
+    if this.data_symbols > 16
+      table_bits = 3
+      while this.data_symbols > (1 << (table_bits + 2))
+        table_bits += 1
+      end
+      this.table_size = (1 << table_bits) + 4
+      this.table_shift = DM_LENGTH_SHIFT - table_bits
+      this.decoder_table = zeros(UInt32, this.table_size + 6)
+    else # small alphabet: no table needed
+      this.table_size = this.table_shift = 0;
+      this.decoder_table = UInt32[]
+    end
+    this.distribution = zeros(UInt32, this.data_symbols)
+  end
+
+  # compute cumulative distribution, decoder table
+  s::UInt32 = 0
+  sum::Float64 = 0.0
+  p::Float64 = 1 / Float64(this.data_symbols)
+
+  for k in 1:this.data_symbols
+    if !isnothing(probability)
+      p = probability[k]
+    end
+    0.0001 <= p <= 0.9999 || error("invalid symbol probability")
+    this.distribution[k] = floor(UInt32, sum * (1 << DM_LENGTH_SHIFT))
+    sum += p
+    iszero(this.table_size) && continue
+    w::UInt32 = this.distribution[k] >> this.table_shift
+    while (s < w)
+      s += 1
+      this.decoder_table[s + 1] = k - 2
+    end
+  end
+
+  if !iszero(this.table_size)
+    this.decoder_table[1] = 0
+    while s <= this.table_size
+      s += 1
+      this.decoder_table[s + 1] = this.data_symbols - 1
+    end
+  end
+
+  0.9999 <= sum <= 1.0001 || error("invalid probabilities");
   this
 end
 
@@ -151,6 +204,9 @@ end
 
 export AdaptiveDataModel, model_symbols, reset!, set_alphabet!
 
+# Maximum values for general models length bits discarded before mult. for adaptive models
+const DM_LENGTH_SHIFT = 15
+
 """
 Adaptive model for binary data
 """
@@ -169,11 +225,11 @@ mutable struct AdaptiveDataModel
   table_size::UInt32
   table_shift::UInt32
 
-  AdaptiveDataModel(number_of_symbols::UInt32 = zero(UInt32)) = new(
-    ntuple(_ -> UInt32[], 3)...,
-    ntuple(_ -> zero(UInt32), 3)...,
-    ntuple(_ -> zero(UInt32), 4)...,
-  )
+  AdaptiveDataModel(number_of_symbols::UInt32 = zero(UInt32)) = set_alphabet!(new(
+      ntuple(_ -> UInt32[], 3)...,
+      ntuple(_ -> zero(UInt32), 3)...,
+      ntuple(_ -> zero(UInt32), 4)...,
+    ), number_of_symbols)
 
 end
 
@@ -185,17 +241,91 @@ end
 Reset to equiprobable model
 """
 function reset!(this::AdaptiveDataModel)
-  error("not implemented")
+  iszero(this.data_symbols) && return this
+  # restore probability estimates to uniform distribution
+  this.total_count = 0
+  this.update_cycle = this.data_symbols
+  this.symbol_count .= 1
+  update!(this, false)
+  this.symbols_until_update = this.update_cycle = (this.data_symbols + UInt32(6)) >> 1
   this
 end
 
-function set_alphabet!(number_of_symbols::UInt32)
-  error("not implemented")
-  this
+function set_alphabet!(this::AdaptiveDataModel, number_of_symbols::UInt32)
+  2 <= number_of_symbols <= (1 << 11) || error("invalid number of data symbols")
+
+  # assign memory for data model
+  if this.data_symbols != number_of_symbols
+    this.data_symbols = number_of_symbols
+    this.last_symbol = this.data_symbols - 1
+
+    # define size of table for fast decoding
+    if this.data_symbols > 16
+      table_bits = 3
+      while this.data_symbols > (one(UInt32) << (table_bits + 2))
+        table_bits += 1
+      end
+      this.table_size = (UInt32(1) << table_bits) + UInt32(4)
+      this.table_shift = DM_LENGTH_SHIFT - table_bits
+      this.decoder_table = zeros(UInt32, this.table_size + 6)
+    else # small alphabet: no table needed
+      this.table_size = this.table_shift = 0
+      this.decoder_table = UInt32[]
+    end
+
+    this.distribution = zeros(UInt32, this.data_symbols)
+    this.symbol_count = zeros(UInt32, this.data_symbols)
+  end
+
+  reset!(this) # initialize model
 end
 
-function update!(this::AdaptiveDataModel, ::Bool)
-  error("not implemented")
+function update!(this::AdaptiveDataModel, from_encoder::Bool)
+
+  # halve counts when a threshold is reached
+  if (this.total_count += this.update_cycle) > (one(UInt32) << DM_LENGTH_SHIFT)
+    this.total_count = 0;
+    for n in 1:this.data_symbols
+      this.total_count += (this.symbol_count[n] = (this.symbol_count[n] + 1) >> 1)
+    end
+  end
+
+  # compute cumulative distribution, decoder table
+  sum::UInt32 = 0
+  s::UInt32 = 0
+
+  scale::UInt32 = div(0x80000000, this.total_count)
+
+  if from_encoder || iszero(this.table_size)
+    for k in 1:this.data_symbols
+      this.distribution[k] = (scale * sum) >> (31 - DM_LENGTH_SHIFT)
+      sum += this.symbol_count[k]
+    end
+  else
+    for k in 1:this.data_symbols
+      this.distribution[k] = (scale * sum) >> (31 - DM_LENGTH_SHIFT)
+      sum += this.symbol_count[k]
+      w::UInt32 = this.distribution[k] >> this.table_shift
+      while s < w
+        s += 1
+        this.decoder_table[s + 1] = UInt32(k) - UInt32(2)
+      end
+    end
+    this.decoder_table[1] = 0
+    while s <= this.table_size
+      s += 1
+      this.decoder_table[s + 1] = this.data_symbols - UInt32(1)
+    end
+  end
+
+  # set frequency of model updates
+  this.update_cycle = (5 * this.update_cycle) >> 2
+  max_cycle::UInt32 = (this.data_symbols + 6) << 3
+  if this.update_cycle > max_cycle
+    this.update_cycle = max_cycle
+  end
+  this.symbols_until_update = this.update_cycle
+
   this
 end
 
@@ -400,14 +530,84 @@ function decode!(this::ArithmeticCodec, M::StaticBitModel)::UInt32
   bit # return data bit value
 end
 
-function encode!(this::ArithmeticCodec, data::UInt32, ::StaticDataModel)
-  error("not implemented")
+function encode!(this::ArithmeticCodec, data::UInt32, M::StaticDataModel)
+  DEBUG && this.mode != 1 &&error("encoder not initialized")
+  DEBUG && data >= M.data_symbols && error("invalid data symbol")
+
+  init_base::UInt32 = this.base
+
+  # compute products
+  if (data == M.last_symbol)
+    x = M.distribution[data + 1] * (this.length >> DM_LENGTH_SHIFT)
+    this.base   += x # update interval
+    this.length -= x # no product needed
+  else
+    x = M.distribution[data + 1] * (this.length >>= DM_LENGTH_SHIFT)
+    this.base   += x # update interval
+    this.length  = M.distribution[data + 2] * this.length - x
+  end
+
+  init_base > this.base && propagate_carry!(this) # overflow = carry
+  this.length < AC_MIN_LENGTH && renorm_enc_interval!(this) # renormalization
+
   this
 end
 
-function decode!(this::ArithmeticCodec, ::StaticDataModel)::UInt32
-  error("not implemented")
-  zero(UInt32)
+function decode!(this::ArithmeticCodec, M::StaticDataModel)::UInt32
+  DEBUG && this.mode != 2 && error("decoder not initialized")
+
+  y::UInt32 = this.length
+
+  if !isempty(M.decoder_table) # use table look-up for faster decoding
+
+    dv::UInt32 = div(this.value, (this.length >>= DM_LENGTH_SHIFT))
+    t::UInt32 = dv >> M.table_shift
+
+    s::UInt32 = M.decoder_table[t + 1] # initial decision based on table look-up
+    n::UInt32 = M.decoder_table[t + 2] + 1
+
+    while n > s + 1 # finish with bisection search
+      m::UInt32 = (s + n) >> 1
+      if M.distribution[m + 1] > dv
+        n = m
+      else
+        s = m
+      end
+    end
+
+    # compute products
+    x::UInt32 = M.distribution[s + 1] * this.length
+    if s != M.last_symbol
+      y = M.distribution[s + 2] * this.length
+    end
+
+  else # decode using only multiplications
+
+    x = s = 0
+    this.length >>= DM_LENGTH_SHIFT
+    m = (n = M.data_symbols) >> 1
+
+    # decode via bisection search
+    while true
+      z::UInt32 = this.length * M.distribution[m + 1]
+      if (z > this.value) # value is smaller
+        n = m
+        y = z
+      else # value is larger or equal
+        s = m
+        x = z
+      end
+      (m = (s + n) >> 1) != s || break
+    end
+  end
+
+  # update interval
+  this.value -= x
+  this.length = y - x;
+
+  this.length < AC_MIN_LENGTH && renorm_dec_interval!(this) # renormalization
+
+  s
 end
 
 function encode!(this::ArithmeticCodec, bit::UInt32, M::AdaptiveBitModel)
@@ -455,14 +655,91 @@ function decode!(this::ArithmeticCodec, M::AdaptiveBitModel)::UInt32
   bit # return data bit value
 end
 
-function encode!(this::ArithmeticCodec, data::UInt32, ::AdaptiveDataModel)
-  error("not implemented")
+function encode!(this::ArithmeticCodec, data::UInt32, M::AdaptiveDataModel)
+  DEBUG && this.mode != 1 && error("encoder not initialized")
+  DEBUG && data >= M.data_symbols && error("invalid data symbol")
+
+  init_base::UInt32 = this.base
+
+  # compute products
+  if data == M.last_symbol
+    x::UInt32 = M.distribution[data + 1] * (this.length >> DM_LENGTH_SHIFT)
+    this.base   += x # update interval
+    this.length -= x # no product needed
+  else
+    x = M.distribution[data + 1] * (this.length >>= DM_LENGTH_SHIFT)
+    this.base   += x # update interval
+    this.length  = M.distribution[data + 2] * this.length - x
+  end
+
+  init_base > this.base && propagate_carry!(this) # overflow = carry
+
+  this.length < AC_MIN_LENGTH && renorm_enc_interval!(this) # renormalization
+
+  M.symbol_count[data + 1] += 1
+  iszero(M.symbols_until_update -= 1) && update!(M, true) # periodic model update
+
   this
 end
 
-function decode!(this::ArithmeticCodec, ::AdaptiveDataModel)::UInt32
-  error("not implemented")
-  zero(UInt32)
+function decode!(this::ArithmeticCodec, M::AdaptiveDataModel)::UInt32
+  DEBUG && this.mode != 2 && error("decoder not initialized")
+
+  y::UInt32 = this.length
+
+  if !isempty(M.decoder_table) # use table look-up for faster decoding
+
+    dv::UInt32 = div(this.value, (this.length >>= DM_LENGTH_SHIFT))
+    t::UInt32 = dv >> M.table_shift
+
+    # initial decision based on table look-up
+    s::UInt32 = M.decoder_table[t + 1]
+    n::UInt32 = M.decoder_table[t + 2] + 1
+
+    while (n > s + 1) # finish with bisection search
+      m::UInt32 = (s + n) >> 1
+      if M.distribution[m + 1] > dv
+        n = m
+      else
+        s = m
+      end
+    end
+
+    # compute products
+    x::UInt32 = M.distribution[s + 1] * this.length
+    if s != M.last_symbol
+      y = M.distribution[s + 2] * this.length
+    end
+
+  else # decode using only multiplications
+
+    x = s = zero(UInt32)
+    this.length >>= DM_LENGTH_SHIFT
+    m = (n = M.data_symbols) >> 1
+
+    # decode via bisection search
+    while true
+      z::UInt32 = this.length * M.distribution[m + 1]
+      if (z > this.value) # value is smaller
+        n = m
+        y = z
+      else # value is larger or equal
+        s = m
+        x = z
+      end
+      (m = (s + n) >> 1) != s || break
+    end
+  end
+
+  this.value -= x # update interval
+  this.length = y - x
+
+  this.length < AC_MIN_LENGTH && renorm_dec_interval!(this) # renormalization
+
+  M.symbol_count[s + 1] += 1
+  iszero(M.symbols_until_update -= 1) && update!(M, false) # periodic model update
+
+  return s;
 end
 
 function propagate_carry!(this::ArithmeticCodec)
