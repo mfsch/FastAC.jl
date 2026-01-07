@@ -25,24 +25,13 @@
 # NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 # SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-module ReferenceTests
+module RandomData
 
-export reference_tests
+export RandomGenerator
 
-using FastAC, Test
-
-const SIMUL_TESTS::UInt32 = 1_000_000
 const MIN_PROBABILITY::Float64 = 1e-4
 
-function reference_tests(alphabet_symbols, test_cycles = 10)
-  2 <= alphabet_symbols <= 500 || error("invalid number of data symbols")
-  1 <= test_cycles <= 999 || error("invalid number of simulations")
-  if alphabet_symbols == 2
-    binary_benchmark(test_cycles)
-  else
-    general_benchmark(alphabet_symbols, test_cycles)
-  end
-end
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 mutable struct RandomGenerator
   s1::UInt32
@@ -77,6 +66,8 @@ end
 
 get_integer!(this::RandomGenerator, range::UInt32) = floor(UInt32, range * get_uniform!(this))
 
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
 mutable struct RandomBitSource
   generator::RandomGenerator
   threshold::UInt32
@@ -90,6 +81,7 @@ set_seed!(this::RandomBitSource, seed) = (set_seed!(this.generator, seed); this)
 entropy(this::RandomBitSource) = this.ent
 symbol_0_probability(this::RandomBitSource) = this.prob_0
 symbol_1_probability(this::RandomBitSource) = 1 - this.prob_0
+probability(this::RandomBitSource) = (this.prob_0, 1 - this.prob_0)
 
 function set_probability_0!(this::RandomBitSource, p0::Float64)::Float64
   MIN_PROBABILITY <= p0 <= 1 - MIN_PROBABILITY || error("invalid random bit probability")
@@ -117,6 +109,8 @@ shuffle_probabilities!(this::RandomBitSource) =
   (get_word!(this.generator) > 0x80000000 && set_probability_0!(this, 1 - this.prob_0); this)
 
 get_bit!(this::RandomBitSource) = UInt32(get_word!(this.generator) > this.threshold)
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 # Pseudo-random generator of data symbols with given probabilities
 mutable struct RandomDataSource
@@ -190,6 +184,75 @@ function set_distribution!(this::RandomDataSource, dim::UInt32, probability::Vec
   abs(1 - sum) > 1e-4 && Error("invalid random source distribution")
   this.ent /= log(2)
 end
+
+function set_truncated_geometric!(this::RandomDataSource, dim::UInt32, entropy::Float64)::Float64
+  assign_memory!(this, dim)
+
+  max_entropy = log(this.symbols) / log(2)
+  mgr_prob = (dim - 1) * MIN_PROBABILITY
+  min_entropy = ((mgr_prob - 1) * log(1 - mgr_prob) - mgr_prob * log(MIN_PROBABILITY)) * 1.2 / log(2)
+  min_entropy < entropy <= max_entropy || error("invalid data source entropy")
+
+  # find distribution with desired entropy
+  ZF = ZeroFinder(0.0, 2.0)
+  a = set_new_result!(ZF, max_entropy - entropy)
+
+  for _ in 1:20
+    ne = set_tg!(this, a) - entropy
+    abs(ne) < 1e-5 && break
+    a = set_new_result!(ZF, ne)
+  end
+
+  set_distribution!(this, this.symbols, this.prob)
+  abs(this.ent - entropy) > 1e-4 && error("cannot set random source entropy")
+
+  this.ent
+end
+
+function assign_memory!(this::RandomDataSource, dim::UInt32)
+  this.symbols == dim && return this
+  this.symbols = dim
+  this.prob = zeros(dim)
+  this.dist = zeros(UInt32, dim)
+  this
+end
+
+function set_tg!(this::RandomDataSource, a::Float64)::Float64
+  m = this.symbols
+
+  s = if a > 1e-4
+    (1 - exp(-a)) / (1 - exp(-a * m))
+  else
+    (2 - a) / (m * (2 - a * m))
+  end
+
+  r::Float64 = 0
+  e::Float64 = 0
+
+  for n in (this.symbols - 1):-1:0
+
+    p::Float64 = (a * n > 30 ? 0 : s * exp(-a * n))
+
+    if (p < MIN_PROBABILITY)
+      r += MIN_PROBABILITY - p
+      p = MIN_PROBABILITY
+    elseif r > 0
+      if r <= p - MIN_PROBABILITY
+        p -= r
+        r = 0
+      else
+        r -= p - MIN_PROBABILITY
+        p = MIN_PROBABILITY
+      end
+    end
+    this.prob[n + 1] = p
+    e -= p * log(p)
+  end
+
+  return e / log(2)
+end
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 # Class used by 'RandomDataSource' to find source parameters
 mutable struct ZeroFinder
@@ -279,231 +342,4 @@ function set_new_result!(this::ZeroFinder, y::Float64) # returns new test
   this.x = this.x1
 end
 
-
-function set_truncated_geometric!(this::RandomDataSource, dim::UInt32, entropy::Float64)::Float64
-  assign_memory!(this, dim)
-
-  max_entropy = log(this.symbols) / log(2)
-  mgr_prob = (dim - 1) * MIN_PROBABILITY
-  min_entropy = ((mgr_prob - 1) * log(1 - mgr_prob) - mgr_prob * log(MIN_PROBABILITY)) * 1.2 / log(2)
-  min_entropy < entropy <= max_entropy || error("invalid data source entropy")
-
-  # find distribution with desired entropy
-  ZF = ZeroFinder(0.0, 2.0)
-  a = set_new_result!(ZF, max_entropy - entropy)
-
-  for _ in 1:20
-    ne = set_tg!(this, a) - entropy
-    abs(ne) < 1e-5 && break
-    a = set_new_result!(ZF, ne)
-  end
-
-  set_distribution!(this, this.symbols, this.prob)
-  abs(this.ent - entropy) > 1e-4 && error("cannot set random source entropy")
-
-  this.ent
-end
-
-function assign_memory!(this::RandomDataSource, dim::UInt32)
-  this.symbols == dim && return this
-  this.symbols = dim
-  this.prob = zeros(dim)
-  this.dist = zeros(UInt32, dim)
-  this
-end
-
-function set_tg!(this::RandomDataSource, a::Float64)::Float64
-  m = this.symbols
-
-  s = if a > 1e-4
-    (1 - exp(-a)) / (1 - exp(-a * m))
-  else
-    (2 - a) / (m * (2 - a * m))
-  end
-
-  r::Float64 = 0
-  e::Float64 = 0
-
-  for n in (this.symbols - 1):-1:0
-
-    p::Float64 = (a * n > 30 ? 0 : s * exp(-a * n))
-
-    if (p < MIN_PROBABILITY)
-      r += MIN_PROBABILITY - p
-      p = MIN_PROBABILITY
-    elseif r > 0
-      if r <= p - MIN_PROBABILITY
-        p -= r
-        r = 0
-      else
-        r -= p - MIN_PROBABILITY
-        p = MIN_PROBABILITY
-      end
-    end
-    this.prob[n + 1] = p
-    e -= p * log(p)
-  end
-
-  return e / log(2)
-end
-
-
-function binary_benchmark(num_cycles)
-
-  # set simulation parameters
-  num_simulations = 10
-  entropy = 0.1
-  entropy_increment = 0.1
-
-  # variables
-  src = RandomBitSource()
-  codec = ArithmeticCodec(SIMUL_TESTS >> 2)
-  static_model = StaticBitModel()
-  adaptive_model = AdaptiveBitModel()
-
-  source_bits = zeros(UInt8, SIMUL_TESTS)
-  decoded_bits = zeros(UInt8, SIMUL_TESTS)
-
-  for simul in 1:num_simulations
-    for pass in 1:2
-
-      set_entropy!(src, entropy)
-      set_seed!(src, UInt32(1839304 + 2017 * (simul - 1)))
-
-      for _ in 1:num_cycles
-
-        # fill bit buffer
-        shuffle_probabilities!(src)
-        foreach(ind -> source_bits[ind] = get_bit!(src), eachindex(source_bits))
-
-        if pass == 1 # test static model
-
-          FastAC.set_probability_0!(static_model, symbol_0_probability(src))
-
-          # encode bit buffer
-          start_encoder!(codec)
-          foreach(bit -> encode!(codec, UInt32(bit), static_model), source_bits)
-          code_bits = 8 * stop_encoder!(codec)
-
-          # check that the compressed size is <1% away from the optimal size
-          @test 0.99 < entropy / (code_bits / SIMUL_TESTS) <= 1.01
-
-          # decode bit buffer
-          start_decoder!(codec)
-          foreach(ind -> decoded_bits[ind] = decode!(codec, static_model), eachindex(decoded_bits))
-          stop_decoder!(codec)
-
-        else # test adaptive model
-
-          # encode bit buffer
-          reset!(adaptive_model)
-          start_encoder!(codec)
-          foreach(bit -> encode!(codec, UInt32(bit), adaptive_model), source_bits)
-          code_bits = 8 * stop_encoder!(codec)
-
-          # check that the compressed size is <2% away from the optimal size
-          @test 0.98 < entropy / (code_bits / SIMUL_TESTS) <= 1.02
-
-          # decode bit buffer
-          reset!(adaptive_model)
-          start_decoder!(codec)
-          foreach(ind -> decoded_bits[ind] = decode!(codec, adaptive_model), eachindex(decoded_bits))
-          stop_decoder!(codec)
-
-        end
-      end
-
-      # check for decoding errors
-      @test source_bits == decoded_bits
-    end
-
-    entropy += entropy_increment
-  end
-end
-
-function general_benchmark(data_symbols, num_cycles)
-
-  # set simulation parameters
-  if data_symbols <= 8
-    entropy = 0.2;
-    entropy_increment = 0.20;
-  elseif data_symbols <= 32
-    entropy = 0.5;
-    entropy_increment = 0.25;
-  else
-    entropy = 1.0;
-    entropy_increment = 0.50;
-  end
-
-  num_simulations = 1 + floor(Int, (log(data_symbols) / log(2) - entropy) / entropy_increment)
-
-  # variables
-  src = RandomDataSource()
-  codec = ArithmeticCodec(SIMUL_TESTS << 1)
-  static_model = StaticDataModel()
-  adaptive_model = AdaptiveDataModel(UInt32(data_symbols))
-
-  # assign memory for random test data
-  source_data  = zeros(UInt16, SIMUL_TESTS)
-  decoded_data = zeros(UInt16, SIMUL_TESTS)
-
-  set_alphabet!(adaptive_model, UInt32(data_symbols))
-
-  for simul in 1:num_simulations
-    for pass in 1:2
-
-      set_truncated_geometric!(src, UInt32(data_symbols), entropy)
-      set_seed!(src, UInt32(8315739 + 1031 * (simul - 1) + 11 * data_symbols))
-
-      for _ in 1:num_cycles
-
-        shuffle_probabilities!(src)
-        foreach(ind -> source_data[ind] = get_data!(src), eachindex(source_data))
-
-        if pass == 1 # test static model
-
-          FastAC.set_distribution!(static_model, UInt32(data_symbols), probability(src))
-
-          # encode data buffer
-          start_encoder!(codec)
-          foreach(x -> encode!(codec, UInt32(x), static_model), source_data)
-          code_bits = 8 * stop_encoder!(codec)
-
-          # check that the compressed size is <1% away from the optimal size
-          @test 0.99 < entropy / (code_bits / SIMUL_TESTS) <= 1.01
-
-          # decode data buffer
-          start_decoder!(codec)
-          foreach(ind -> decoded_data[ind] = decode!(codec, static_model), eachindex(decoded_data))
-          stop_decoder!(codec)
-
-        else # test adaptive model
-
-          reset!(adaptive_model)
-
-          # encode data buffer
-          start_encoder!(codec)
-          foreach(x -> encode!(codec, UInt32(x), adaptive_model), source_data)
-          code_bits = 8 * stop_encoder!(codec)
-
-          # check that the compressed size is <1% away from the optimal size
-          @test 0.99 < entropy / (code_bits / SIMUL_TESTS) <= 1.01
-
-          reset!(adaptive_model)
-
-          # decode data buffer
-          start_decoder!(codec)
-          foreach(ind -> decoded_data[ind] = decode!(codec, adaptive_model), eachindex(decoded_data))
-          stop_decoder!(codec)
-        end
-
-        # check for decoding errors
-        @test source_data == decoded_data
-      end
-    end
-
-    entropy += entropy_increment;
-  end
-end
-
-end # module ReferenceTests
+end # module RandomData
