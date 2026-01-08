@@ -35,35 +35,36 @@ const SIMUL_TESTS::UInt32 = 1_000_000
 function reference_benchmark(data_symbols, test_cycles = 10; verbose = false)
   2 <= data_symbols <= 500 || error("invalid number of data symbols")
   1 <= test_cycles <= 999 || error("invalid number of simulations")
+  isbits = data_symbols == 2
 
   entropies = let
     hmax = log2(data_symbols) # max entropy (equal probability)
-    hmax == 2 ? (0.1:0.1:1) : hmax <= 3 ? (0.2:0.2:hmax) : hmax <= 5 ? (0.5:0.25:hmax) : (1.0:0.5:hmax)
+    isbits ? (0.1:0.1:1) : hmax <= 3 ? (0.2:0.2:hmax) : hmax <= 5 ? (0.5:0.25:hmax) : (1.0:0.5:hmax)
   end
 
-  if data_symbols == 2
+  if isbits
     T = UInt8
     src = RandomData.RandomBitSource()
-    static_model = StaticBitModel()
-    adaptive_model = AdaptiveBitModel()
+    static_model = StaticBitModel
+    adaptive_model = AdaptiveBitModel
   else
     # could use UInt8 when <=256, but keeping it the same as the C++ code for now
     T = UInt16
     src = RandomData.RandomDataSource()
-    static_model = StaticDataModel()
-    adaptive_model = AdaptiveDataModel(UInt32(data_symbols))
+    static_model = StaticDataModel{data_symbols}
+    adaptive_model = AdaptiveDataModel{data_symbols}
   end
 
   # assign memory for random test data
   source_data = zeros(T, SIMUL_TESTS)
   decoded_data = zeros(T, SIMUL_TESTS)
 
-  set = "Static & adaptive " * (data_symbols == 2 ? "bit" : "data") * " models"
+  set = "Static & adaptive " * (isbits ? "bit" : "data") * " models"
   @testset "$set ($data_symbols symbols)" begin
     @testset "entropy = $entropy" for (simul, entropy) in enumerate(entropies)
-      for model in (static_model, adaptive_model)
+      for model_type in (static_model, adaptive_model)
 
-        if data_symbols == 2
+        if isbits
           RandomData.set_entropy!(src, entropy)
           RandomData.set_seed!(src, UInt32(1839304 + 2017 * (simul - 1)))
         else
@@ -79,33 +80,34 @@ function reference_benchmark(data_symbols, test_cycles = 10; verbose = false)
 
           # fill data buffer
           RandomData.shuffle_probabilities!(src)
-          get_data = data_symbols == 2 ? RandomData.get_bit! : RandomData.get_data!
+          get_data = isbits ? RandomData.get_bit! : RandomData.get_data!
           foreach(ind -> source_data[ind] = get_data(src), eachindex(source_data))
 
           # set up distribution of model
-          if model isa StaticBitModel
-            FastAC.set_probability_0!(static_model, RandomData.symbol_0_probability(src))
-          elseif model isa StaticDataModel
-            FastAC.set_distribution!(model, UInt32(data_symbols), RandomData.probability(src))
+          model = if model_type <: StaticBitModel
+            model_type(probability_0 = RandomData.symbol_0_probability(src))
+            #continue
+          elseif model_type <: StaticDataModel
+            model_type(RandomData.probability(src))
           else
-            reset!(model)
+            model_type()
           end
 
           # encode data buffer
-          enc = Encoder()
+          enc = Encoder(IOBuffer(sizehint = SIMUL_TESTS << (isbits ? -2 : 1)))
           start_time = time()
-          foreach(x -> encode!(enc, x, model), source_data)
+          encode!(enc, source_data, model)
           test_cycles > 1 && (encode_time += time() - start_time)
           encoded_data = finalize!(enc)
           code_bits += 8 * length(encoded_data)
 
           # start with fresh distribution for decoding
-          model isa Union{AdaptiveBitModel,AdaptiveDataModel} && reset!(model)
+          model_type <: Union{AdaptiveBitModel,AdaptiveDataModel} && reset!(model)
 
           # decode data buffer
           dec = Decoder(encoded_data)
           start_time = time()
-          foreach(ind -> decoded_data[ind] = decode!(dec, model), eachindex(decoded_data))
+          decode!(dec, decoded_data, model)
           test_cycles > 1 && (decode_time += time() - start_time)
 
           # check for decoding errors
@@ -118,8 +120,8 @@ function reference_benchmark(data_symbols, test_cycles = 10; verbose = false)
         encode_speed = SIMUL_TESTS * (test_cycles - 1) * 1e-6 / encode_time # M symbols / sec
         decode_speed = SIMUL_TESTS * (test_cycles - 1) * 1e-6 / decode_time # M symbols / sec
         probabilities = Tuple(floor(1000 * p) / 1000 for p in RandomData.probability(src))
-        verbose && @info "$(typeof(model)) with entropy = $entropy" probabilities bit_rate redundancy (
-          encode_speed) decode_speed
+        verbose && @info "$model_type with entropy = $entropy" probabilities bit_rate (
+          redundancy) encode_speed decode_speed
         @test abs(redundancy) < 1
       end
     end

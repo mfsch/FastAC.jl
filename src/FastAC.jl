@@ -27,14 +27,10 @@
 
 module FastAC
 
-export StaticBitModel, set_probability_0!
-export StaticDataModel, model_symbols, set_distribution!
-export AdaptiveBitModel, reset!
-export AdaptiveDataModel, model_symbols, reset!, set_alphabet!
-export Encoder, Decoder, finalize!,
-  read_from_file!, write_to_file!, put_bit!,
-  get_bit!, put_bits!, get_bits!, encode!, decode!
+export Encoder, Decoder, finalize!, encode!, decode!
+export StaticBitModel, StaticDataModel, AdaptiveBitModel, AdaptiveDataModel, reset!
 
+using StaticArrays: MVector
 
 """
     reset!(model)
@@ -47,28 +43,28 @@ function reset! end
 # length bits discarded before mult. for adaptive models
 const BM_LENGTH_SHIFT = 13 # maximum values for binary models
 const DM_LENGTH_SHIFT = 15 # maximum values for general models
-const DEBUG = true
+
+abstract type Model{N} end
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 """
 Static model for binary data
 """
-mutable struct StaticBitModel
+struct StaticBitModel <: Model{2}
 
   bit_0_prob::UInt32
 
-  StaticBitModel() = new(one(UInt32) << (BM_LENGTH_SHIFT - 1))
-
-end
-
-"""
-Set probability of symbol '0'
-"""
-function set_probability_0!(this::StaticBitModel, p0::Float64)
-  0.0001 <= p0 <= 0.9999 || error("invalid bit probability")
-  this.bit_0_prob = floor(UInt32, p0 * (1 << BM_LENGTH_SHIFT))
-  this
+  function StaticBitModel(; probability_0 = nothing, probability_1 = nothing)
+    p0(::Nothing, ::Nothing) = nothing
+    p0(p0::Real, ::Nothing) = p0
+    p0(::Nothing, p1::Real) = 1 - p1
+    p0(p0::Real, p1::Real) = p0 + p1 ≈ 1 ? p0 : error("")
+    p0_real = p0(probability_0, probability_1)
+    isnothing(p0_real) && return new(one(UInt32) << (BM_LENGTH_SHIFT - 1))
+    0.0001 <= p0_real <= 0.9999 || error("invalid bit probability")
+    new(floor(UInt32, p0_real * (1 << BM_LENGTH_SHIFT)))
+  end
 end
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -76,83 +72,74 @@ end
 """
 Static model for general data
 """
-mutable struct StaticDataModel
+struct StaticDataModel{N,D} <: Model{N}
 
-  distribution::Vector{UInt32}
-  decoder_table::Vector{UInt32}
+  distribution::MVector{N,UInt32}
+  decoder_table::MVector{D,UInt32}
+  table_shift::Int
 
-  data_symbols::UInt32
-  last_symbol::UInt32
-  table_size::UInt32
-  table_shift::UInt32
-
-  StaticDataModel() = new(
-    ntuple(_ -> UInt32[], 2)...,
-    ntuple(_ -> zero(UInt32), 4)...,
-  )
-
-end
-
-model_symbols(this::StaticDataModel)::UInt32 = this.data_symbols
-
-function set_distribution!(
-  this::StaticDataModel,
-  number_of_symbols::UInt32,
-  probability::Union{Nothing,Vector{Float64}} = nothing, # `nothing` means uniform
-)
-  2 <= number_of_symbols <= (1 << 11) || error("invalid number of data symbols")
-
-  # assign memory for data model
-  if this.data_symbols != number_of_symbols
-    this.data_symbols = number_of_symbols
-    this.last_symbol = this.data_symbols - 1
+  function StaticDataModel{N}() where {N}
+    2 <= N <= (1 << 11) || error("invalid number of data symbols")
 
     # define size of table for fast decoding
-    if this.data_symbols > 16
+    D, table_shift = if N > 16
       table_bits = 3
-      while this.data_symbols > (1 << (table_bits + 2))
+      while N > (1 << (table_bits + 2))
         table_bits += 1
       end
-      this.table_size = (1 << table_bits) + 4
-      this.table_shift = DM_LENGTH_SHIFT - table_bits
-      this.decoder_table = zeros(UInt32, this.table_size + 6)
+      table_size = (1 << table_bits) + 4
+      table_size + 6, DM_LENGTH_SHIFT - table_bits # why 6 extra values?
     else # small alphabet: no table needed
-      this.table_size = this.table_shift = 0
-      this.decoder_table = UInt32[]
+      0, 0
     end
-    this.distribution = zeros(UInt32, this.data_symbols)
+
+    # assign memory for data model
+    model = new{N,D}(zeros(MVector{N,UInt32}), zeros(MVector{D,UInt32}), table_shift)
+    reset!(model)
   end
+end
+
+StaticDataModel(data_symbols::Integer) = StaticDataModel{Int(data_symbols)}()
+StaticDataModel{N}(probability::Vector{Float64}) where {N} =
+  reset!(StaticDataModel{N}(), probability)
+StaticDataModel(probability::Vector{Float64}) =
+  reset!(StaticDataModel{length(probability)}(), probability)
+
+function reset!(
+    model::StaticDataModel{N,D},
+    probability::Union{Nothing,Vector{Float64}} = nothing, # `nothing` means uniform
+  ) where {N,D}
 
   # compute cumulative distribution, decoder table
   s::UInt32 = 0
   sum::Float64 = 0.0
-  p::Float64 = 1 / Float64(this.data_symbols)
+  p::Float64 = 1 / N
 
-  for k in 1:this.data_symbols
+  for k in 1:N
     if !isnothing(probability)
       p = probability[k]
     end
     0.0001 <= p <= 0.9999 || error("invalid symbol probability")
-    this.distribution[k] = floor(UInt32, sum * (1 << DM_LENGTH_SHIFT))
+    model.distribution[k] = floor(UInt32, sum * (1 << DM_LENGTH_SHIFT))
     sum += p
-    iszero(this.table_size) && continue
-    w::UInt32 = this.distribution[k] >> this.table_shift
+    iszero(D) && continue
+    w::UInt32 = model.distribution[k] >> model.table_shift
     while (s < w)
       s += 1
-      this.decoder_table[s + 1] = k - 2
+      model.decoder_table[s + 1] = k - 2
     end
   end
 
-  if !iszero(this.table_size)
-    this.decoder_table[1] = 0
-    while s <= this.table_size
+  if !iszero(D)
+    model.decoder_table[1] = 0
+    while s <= D - 6 # 6 extra values in table (maybe not needed?)
       s += 1
-      this.decoder_table[s + 1] = this.data_symbols - 1
+      model.decoder_table[s + 1] = N - 1
     end
   end
 
   0.9999 <= sum <= 1.0001 || error("invalid probabilities")
-  this
+  model
 end
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -160,7 +147,7 @@ end
 """
 Adaptive model for binary data
 """
-mutable struct AdaptiveBitModel
+mutable struct AdaptiveBitModel <: Model{2}
 
   update_cycle::UInt32
   bits_until_update::UInt32
@@ -213,80 +200,62 @@ end
 """
 Adaptive model for binary data
 """
-mutable struct AdaptiveDataModel
+mutable struct AdaptiveDataModel{N,D} <: Model{N}
 
-  distribution::Vector{UInt32}
-  symbol_count::Vector{UInt32}
-  decoder_table::Vector{UInt32}
+  const distribution::MVector{N,UInt32}
+  const symbol_count::MVector{N,UInt32}
+  const decoder_table::MVector{D,UInt32}
+  const table_shift::UInt32
 
   total_count::UInt32
   update_cycle::UInt32
   symbols_until_update::UInt32
 
-  data_symbols::UInt32
-  last_symbol::UInt32
-  table_size::UInt32
-  table_shift::UInt32
-
-  AdaptiveDataModel(number_of_symbols::UInt32 = zero(UInt32)) = set_alphabet!(new(
-      ntuple(_ -> UInt32[], 3)...,
-      ntuple(_ -> zero(UInt32), 3)...,
-      ntuple(_ -> zero(UInt32), 4)...,
-    ), number_of_symbols)
-
-end
-
-function model_symbols(this::AdaptiveDataModel)::UInt32
-  this.data_symbols
-end
-
-function reset!(this::AdaptiveDataModel)
-  iszero(this.data_symbols) && return this
-  # restore probability estimates to uniform distribution
-  this.total_count = 0
-  this.update_cycle = this.data_symbols
-  this.symbol_count .= 1
-  update!(this, false)
-  this.symbols_until_update = this.update_cycle = (this.data_symbols + UInt32(6)) >> 1
-  this
-end
-
-function set_alphabet!(this::AdaptiveDataModel, number_of_symbols::UInt32)
-  2 <= number_of_symbols <= (1 << 11) || error("invalid number of data symbols")
-
-  # assign memory for data model
-  if this.data_symbols != number_of_symbols
-    this.data_symbols = number_of_symbols
-    this.last_symbol = this.data_symbols - 1
+  function AdaptiveDataModel{N}() where {N}
+    2 <= N <= (1 << 11) || error("invalid number of data symbols")
 
     # define size of table for fast decoding
-    if this.data_symbols > 16
+    D, table_shift = if N > 16
       table_bits = 3
-      while this.data_symbols > (one(UInt32) << (table_bits + 2))
+      while N > (1 << (table_bits + 2))
         table_bits += 1
       end
-      this.table_size = (UInt32(1) << table_bits) + UInt32(4)
-      this.table_shift = DM_LENGTH_SHIFT - table_bits
-      this.decoder_table = zeros(UInt32, this.table_size + 6)
+      table_size = (1 << table_bits) + 4
+      table_size + 6, DM_LENGTH_SHIFT - table_bits
     else # small alphabet: no table needed
-      this.table_size = this.table_shift = 0
-      this.decoder_table = UInt32[]
+      0, 0
     end
 
-    this.distribution = zeros(UInt32, this.data_symbols)
-    this.symbol_count = zeros(UInt32, this.data_symbols)
-  end
+    distribution = zeros(MVector{N,UInt32})
+    symbol_count = zeros(MVector{N,UInt32})
+    decoder_table = zeros(MVector{D,UInt32})
+    counts = (zero(UInt32), zero(UInt32), zero(UInt32))
 
-  reset!(this) # initialize model
+    model = new{N,D}(distribution, symbol_count, decoder_table, table_shift, counts...)
+    reset!(model) # initialize tables
+  end
 end
 
-function update!(this::AdaptiveDataModel, from_encoder::Bool)
+AdaptiveDataModel(data_symbols::Integer) = AdaptiveDataModel{Int(data_symbols)}()
+
+function reset!(model::AdaptiveDataModel{N}) where {N}
+  iszero(N) && return model
+  # restore probability estimates to uniform distribution
+  model.total_count = 0
+  model.update_cycle = N
+  model.symbol_count .= 1
+  update!(model, false)
+  model.symbols_until_update = model.update_cycle = (N + 6) >> 1
+  model
+end
+
+function update!(model::AdaptiveDataModel{N,D}, from_encoder::Bool) where {N,D}
 
   # halve counts when a threshold is reached
-  if (this.total_count += this.update_cycle) > (one(UInt32) << DM_LENGTH_SHIFT)
-    this.total_count = 0
-    for n in 1:this.data_symbols
-      this.total_count += (this.symbol_count[n] = (this.symbol_count[n] + 1) >> 1)
+  if (model.total_count += model.update_cycle) > (one(UInt32) << DM_LENGTH_SHIFT)
+    model.total_count = 0
+    for n in 1:N
+      model.total_count += (model.symbol_count[n] = (model.symbol_count[n] + 1) >> 1)
     end
   end
 
@@ -294,39 +263,35 @@ function update!(this::AdaptiveDataModel, from_encoder::Bool)
   sum::UInt32 = 0
   s::UInt32 = 0
 
-  scale::UInt32 = div(0x80000000, this.total_count)
+  scale::UInt32 = div(0x80000000, model.total_count)
 
-  if from_encoder || iszero(this.table_size)
-    for k in 1:this.data_symbols
-      this.distribution[k] = (scale * sum) >> (31 - DM_LENGTH_SHIFT)
-      sum += this.symbol_count[k]
+  if from_encoder || iszero(D)
+    for k in 1:N
+      model.distribution[k] = (scale * sum) >> (31 - DM_LENGTH_SHIFT)
+      sum += model.symbol_count[k]
     end
   else
-    for k in 1:this.data_symbols
-      this.distribution[k] = (scale * sum) >> (31 - DM_LENGTH_SHIFT)
-      sum += this.symbol_count[k]
-      w::UInt32 = this.distribution[k] >> this.table_shift
+    for k in 1:N
+      model.distribution[k] = (scale * sum) >> (31 - DM_LENGTH_SHIFT)
+      sum += model.symbol_count[k]
+      w::UInt32 = model.distribution[k] >> model.table_shift
       while s < w
         s += 1
-        this.decoder_table[s + 1] = UInt32(k) - UInt32(2)
+        model.decoder_table[s + 1] = UInt32(k) - UInt32(2)
       end
     end
-    this.decoder_table[1] = 0
-    while s <= this.table_size
+    model.decoder_table[1] = 0
+    while s <= D - 6 # table has 6 extra values for some reason (necessary?)
       s += 1
-      this.decoder_table[s + 1] = this.data_symbols - UInt32(1)
+      model.decoder_table[s + 1] = N - 1
     end
   end
 
   # set frequency of model updates
-  this.update_cycle = (5 * this.update_cycle) >> 2
-  max_cycle::UInt32 = (this.data_symbols + 6) << 3
-  if this.update_cycle > max_cycle
-    this.update_cycle = max_cycle
-  end
-  this.symbols_until_update = this.update_cycle
+  model.update_cycle = min((5 * model.update_cycle) >> 2, (N + 3) << 3)
+  model.symbols_until_update = model.update_cycle
 
-  this
+  model
 end
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -362,14 +327,20 @@ end
 Decoder(data::AbstractArray{UInt8}) = Decoder(IOBuffer(data))
 Decoder(filename::AbstractString) = Decoder(open(filename, "r"))
 
-struct ArithmeticCodec end # TODO: remove
-
 """
 Read code data, start decoder
 """
-function read_from_file!(this::ArithmeticCodec, code_file::IOStream)
+function read_from_file!(dec::Decoder, code_file::IOStream)
   error("not implemented")
   this
+end
+
+"""
+Stop encoder, write code data
+"""
+function write_to_file!(enc::Encoder, code_file::IOStream)::UInt32
+  error("not implemented")
+  zero(UInt32)
 end
 
 function finalize!(enc::Encoder{T}) where T
@@ -386,18 +357,9 @@ function finalize!(enc::Encoder{T}) where T
   end
 
   propagate_carry!(enc, init_base) # overflow = carry
-
   renormalize_interval!(enc) # renormalization = output last bytes
 
-  T <: IOBuffer ? take!(seekstart(enc.stream)) : nothing
-end
-
-"""
-Stop encoder, write code data
-"""
-function write_to_file!(this::ArithmeticCodec, code_file::IOStream)::UInt32
-  error("not implemented")
-  zero(UInt32)
+  T <: IOBuffer ? take!(seekstart(enc.stream)) : stream
 end
 
 function encode!(enc::Encoder, data::T, number_of_bits::Integer = 8 * sizeof(T)) where {T<:Integer}
@@ -444,9 +406,20 @@ decode!(dec::Decoder, ::Type{T}, number_of_bits::Integer = 8 * sizeof(T)) where 
 # by default, return bits as an `Int`
 decode!(dec::Decoder, number_of_bits::Integer) = decode!(dec, Int, number_of_bits)
 
-function encode!(enc::Encoder, bit::Integer, M::StaticBitModel)
+# encode a whole vector of values
+encode!(enc::Encoder, data::AbstractVector{<:Integer}, model) =
+  (foreach(val -> encode!(enc, val, model), data); enc)
 
-  x::UInt32 = M.bit_0_prob * (enc.state.length >> BM_LENGTH_SHIFT) # product l x p0
+# decode a whole vector of values
+decode!(dec::Decoder, data::AbstractVector{<:Integer}, model) =
+  (foreach(ind -> (@inbounds data[ind] = decode!(dec, model)), eachindex(data)); data)
+
+# decode a whole vector of values
+decode!(dec::Decoder, count::Integer, model) =
+  map(_ -> decode!(dec, model), 1:count)
+
+function encode!(enc::Encoder, bit::Integer, model::StaticBitModel)
+  x::UInt32 = model.bit_0_prob * (enc.state.length >> BM_LENGTH_SHIFT) # product l x p0
 
   # update interval
   if iszero(bit)
@@ -461,8 +434,8 @@ function encode!(enc::Encoder, bit::Integer, M::StaticBitModel)
   renormalize_interval!(enc)
 end
 
-function decode!(dec::Decoder, M::StaticBitModel)::Bool
-  x::UInt32 = M.bit_0_prob * (dec.state.length >> BM_LENGTH_SHIFT) # product l x p0
+function decode!(dec::Decoder, model::StaticBitModel)::Bool
+  x::UInt32 = model.bit_0_prob * (dec.state.length >> BM_LENGTH_SHIFT) # product l x p0
   bit = (dec.state.value >= x) # decision
 
   # update & shift interval
@@ -478,40 +451,41 @@ function decode!(dec::Decoder, M::StaticBitModel)::Bool
   bit # return data bit value
 end
 
-function encode!(enc::Encoder, data::Integer, M::StaticDataModel)
-  DEBUG && data >= M.data_symbols && error("invalid data symbol")
+function encode!(enc::Encoder, data::Integer, model::StaticDataModel{N}) where {N}
+  @boundscheck data in 0:N-1 || error("invalid data symbol")
 
   init_base::UInt32 = enc.state.base
 
   # compute products
-  if (data == M.last_symbol)
-    x = M.distribution[data + 1] * (enc.state.length >> DM_LENGTH_SHIFT)
-    enc.state.base   += x # update interval
+  x::UInt32 = @inbounds model.distribution[data + 1]
+  if data == N - 1
+    x *= (enc.state.length >> DM_LENGTH_SHIFT)
+    enc.state.base  += x # update interval
     enc.state.length -= x # no product needed
   else
-    x = M.distribution[data + 1] * (enc.state.length >>= DM_LENGTH_SHIFT)
-    enc.state.base   += x # update interval
-    enc.state.length  = M.distribution[data + 2] * enc.state.length - x
+    x *= (enc.state.length >>= DM_LENGTH_SHIFT) # also updates length!
+    enc.state.base  += x # update interval
+    enc.state.length  = @inbounds model.distribution[data + 2] * enc.state.length - x
   end
 
   propagate_carry!(enc, init_base) # overflow = carry
   renormalize_interval!(enc)
 end
 
-function decode!(dec::Decoder, M::StaticDataModel)::UInt32
+function decode!(dec::Decoder, model::StaticDataModel{N})::UInt32 where {N}
   y::UInt32 = dec.state.length
 
-  if !isempty(M.decoder_table) # use table look-up for faster decoding
+  if !isempty(model.decoder_table) # use table look-up for faster decoding
 
     dv::UInt32 = div(dec.state.value, (dec.state.length >>= DM_LENGTH_SHIFT))
-    t::UInt32 = dv >> M.table_shift
+    t::UInt32 = dv >> model.table_shift
 
-    s::UInt32 = M.decoder_table[t + 1] # initial decision based on table look-up
-    n::UInt32 = M.decoder_table[t + 2] + 1
+    s::UInt32 = model.decoder_table[t + 1] # initial decision based on table look-up
+    n::UInt32 = model.decoder_table[t + 2] + 1
 
     while n > s + 1 # finish with bisection search
       m::UInt32 = (s + n) >> 1
-      if M.distribution[m + 1] > dv
+      if model.distribution[m + 1] > dv
         n = m
       else
         s = m
@@ -519,20 +493,20 @@ function decode!(dec::Decoder, M::StaticDataModel)::UInt32
     end
 
     # compute products
-    x::UInt32 = M.distribution[s + 1] * dec.state.length
-    if s != M.last_symbol
-      y = M.distribution[s + 2] * dec.state.length
+    x::UInt32 = model.distribution[s + 1] * dec.state.length
+    if s != N - 1
+      y = model.distribution[s + 2] * dec.state.length
     end
 
   else # decode using only multiplications
 
     x = s = 0
     dec.state.length >>= DM_LENGTH_SHIFT
-    m = (n = M.data_symbols) >> 1
+    m = (n = N) >> 1
 
     # decode via bisection search
     while true
-      z::UInt32 = dec.state.length * M.distribution[m + 1]
+      z::UInt32 = dec.state.length * model.distribution[m + 1]
       if (z > dec.state.value) # value is smaller
         n = m
         y = z
@@ -553,13 +527,13 @@ function decode!(dec::Decoder, M::StaticDataModel)::UInt32
   s
 end
 
-function encode!(enc::Encoder, bit::Integer, M::AdaptiveBitModel)
-  x::UInt32 = M.bit_0_prob * (enc.state.length >> BM_LENGTH_SHIFT) # product l x p0
+function encode!(enc::Encoder, bit::Integer, model::AdaptiveBitModel)
+  x::UInt32 = model.bit_0_prob * (enc.state.length >> BM_LENGTH_SHIFT) # product l x p0
 
   # update interval
   if iszero(bit)
     enc.state.length = x
-    M.bit_0_count += 1
+    model.bit_0_count += 1
   else
     init_base::UInt32 = enc.state.base
     enc.state.base   += x
@@ -568,13 +542,13 @@ function encode!(enc::Encoder, bit::Integer, M::AdaptiveBitModel)
   end
 
   renormalize_interval!(enc)
-  iszero(M.bits_until_update -= 1) && update!(M) # periodic model update
+  iszero(model.bits_until_update -= 1) && update!(model) # periodic model update
 
   enc
 end
 
-function decode!(dec::Decoder, M::AdaptiveBitModel)::Bool
-  x::UInt32 = M.bit_0_prob * (dec.state.length >> BM_LENGTH_SHIFT) # product l x p0
+function decode!(dec::Decoder, model::AdaptiveBitModel)::Bool
+  x::UInt32 = model.bit_0_prob * (dec.state.length >> BM_LENGTH_SHIFT) # product l x p0
   bit = (dec.state.value >= x) # decision
 
   # update interval
@@ -583,55 +557,56 @@ function decode!(dec::Decoder, M::AdaptiveBitModel)::Bool
     dec.state.length -= x
   else
     dec.state.length = x
-    M.bit_0_count += 1
+    model.bit_0_count += 1
   end
 
   renormalize_interval!(dec)
-  iszero(M.bits_until_update -= 1) && update!(M) # periodic model update
+  iszero(model.bits_until_update -= 1) && update!(model) # periodic model update
 
   bit # return data bit value
 end
 
-function encode!(enc::Encoder, data::Integer, M::AdaptiveDataModel)
-  DEBUG && (0 <= data < M.data_symbols || error("invalid data symbol"))
+function encode!(enc::Encoder, data::Integer, model::AdaptiveDataModel{N}) where {N}
+  @boundscheck data in 0:N-1 || error("invalid data symbol")
 
   init_base::UInt32 = enc.state.base
 
   # compute products
-  if data == M.last_symbol
-    x::UInt32 = M.distribution[data + 1] * (enc.state.length >> DM_LENGTH_SHIFT)
+  x::UInt32 = @inbounds model.distribution[data + 1]
+  if data == N - 1
+    x *= (enc.state.length >> DM_LENGTH_SHIFT)
     enc.state.base   += x # update interval
     enc.state.length -= x # no product needed
   else
-    x = M.distribution[data + 1] * (enc.state.length >>= DM_LENGTH_SHIFT)
+    x *= (enc.state.length >>= DM_LENGTH_SHIFT) # updates length too!
     enc.state.base   += x # update interval
-    enc.state.length  = M.distribution[data + 2] * enc.state.length - x
+    enc.state.length = @inbounds model.distribution[data + 2] * enc.state.length - x
   end
 
   propagate_carry!(enc, init_base) # overflow = carry
   renormalize_interval!(enc)
 
-  M.symbol_count[data + 1] += 1
-  iszero(M.symbols_until_update -= 1) && update!(M, true) # periodic model update
+  @inbounds model.symbol_count[data + 1] += 1
+  iszero(model.symbols_until_update -= 1) && update!(model, true) # periodic model update
 
   enc
 end
 
-function decode!(dec::Decoder, M::AdaptiveDataModel)::UInt32
+function decode!(dec::Decoder, model::AdaptiveDataModel{N})::UInt32 where {N}
   y::UInt32 = dec.state.length
 
-  if !isempty(M.decoder_table) # use table look-up for faster decoding
+  if !isempty(model.decoder_table) # use table look-up for faster decoding
 
     dv::UInt32 = div(dec.state.value, (dec.state.length >>= DM_LENGTH_SHIFT))
-    t::UInt32 = dv >> M.table_shift
+    t::UInt32 = dv >> model.table_shift
 
     # initial decision based on table look-up
-    s::UInt32 = M.decoder_table[t + 1]
-    n::UInt32 = M.decoder_table[t + 2] + 1
+    s::UInt32 = model.decoder_table[t + 1]
+    n::UInt32 = model.decoder_table[t + 2] + 1
 
     while (n > s + 1) # finish with bisection search
       m::UInt32 = (s + n) >> 1
-      if M.distribution[m + 1] > dv
+      if model.distribution[m + 1] > dv
         n = m
       else
         s = m
@@ -639,20 +614,20 @@ function decode!(dec::Decoder, M::AdaptiveDataModel)::UInt32
     end
 
     # compute products
-    x::UInt32 = M.distribution[s + 1] * dec.state.length
-    if s != M.last_symbol
-      y = M.distribution[s + 2] * dec.state.length
+    x::UInt32 = model.distribution[s + 1] * dec.state.length
+    if s != N - 1
+      y = model.distribution[s + 2] * dec.state.length
     end
 
   else # decode using only multiplications
 
     x = s = zero(UInt32)
     dec.state.length >>= DM_LENGTH_SHIFT
-    m = (n = M.data_symbols) >> 1
+    m = (n = N) >> 1
 
     # decode via bisection search
     while true
-      z::UInt32 = dec.state.length * M.distribution[m + 1]
+      z::UInt32 = dec.state.length * model.distribution[m + 1]
       if (z > dec.state.value) # value is smaller
         n = m
         y = z
@@ -669,13 +644,13 @@ function decode!(dec::Decoder, M::AdaptiveDataModel)::UInt32
 
   renormalize_interval!(dec)
 
-  M.symbol_count[s + 1] += 1
-  iszero(M.symbols_until_update -= 1) && update!(M, false) # periodic model update
+  model.symbol_count[s + 1] += 1
+  iszero(model.symbols_until_update -= 1) && update!(model, false) # periodic model update
 
   return s
 end
 
-function propagate_carry!(enc::Encoder, init_base)
+@inline function propagate_carry!(enc::Encoder, init_base)
   init_base > enc.state.base || return enc
   # carry propagation on compressed data buffer
   io = enc.stream
@@ -700,7 +675,7 @@ end
   enc
 end
 
-function renormalize_interval!(dec::Decoder)
+@inline function renormalize_interval!(dec::Decoder)
   while dec.state.length < AC_MIN_LENGTH
     # read least-significant byte
     lsb = eof(dec.stream) ? 0x0 : read(dec.stream, UInt8)
