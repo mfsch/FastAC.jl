@@ -27,14 +27,29 @@
 
 module FastAC
 
+export StaticBitModel, set_probability_0!
+export StaticDataModel, model_symbols, set_distribution!
+export AdaptiveBitModel, reset!
+export AdaptiveDataModel, model_symbols, reset!, set_alphabet!
+export Encoder, Decoder, finalize!,
+  read_from_file!, write_to_file!, put_bit!,
+  get_bit!, put_bits!, get_bits!, encode!, decode!
+
+
+"""
+    reset!(model)
+
+Reset the probability distribution of an adaptive model to equal probabilities
+for all data symbols.
+"""
+function reset! end
+
+# length bits discarded before mult. for adaptive models
+const BM_LENGTH_SHIFT = 13 # maximum values for binary models
+const DM_LENGTH_SHIFT = 15 # maximum values for general models
 const DEBUG = true
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
-export StaticBitModel, set_probability_0!
-
-# Maximum values for binary models length bits discarded before mult. for adaptive models
-const BM_LENGTH_SHIFT = 13
 
 """
 Static model for binary data
@@ -57,8 +72,6 @@ function set_probability_0!(this::StaticBitModel, p0::Float64)
 end
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
-export StaticDataModel, model_symbols, set_distribution!
 
 """
 Static model for general data
@@ -104,7 +117,7 @@ function set_distribution!(
       this.table_shift = DM_LENGTH_SHIFT - table_bits
       this.decoder_table = zeros(UInt32, this.table_size + 6)
     else # small alphabet: no table needed
-      this.table_size = this.table_shift = 0;
+      this.table_size = this.table_shift = 0
       this.decoder_table = UInt32[]
     end
     this.distribution = zeros(UInt32, this.data_symbols)
@@ -138,13 +151,11 @@ function set_distribution!(
     end
   end
 
-  0.9999 <= sum <= 1.0001 || error("invalid probabilities");
+  0.9999 <= sum <= 1.0001 || error("invalid probabilities")
   this
 end
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
-export AdaptiveBitModel, reset!
 
 """
 Adaptive model for binary data
@@ -165,9 +176,6 @@ mutable struct AdaptiveBitModel
 
 end
 
-"""
-Reset to equiprobable model
-"""
 function reset!(this::AdaptiveBitModel)
   # initialization to equiprobable model
   this.bit_0_count = 1
@@ -202,11 +210,6 @@ end
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-export AdaptiveDataModel, model_symbols, reset!, set_alphabet!
-
-# Maximum values for general models length bits discarded before mult. for adaptive models
-const DM_LENGTH_SHIFT = 15
-
 """
 Adaptive model for binary data
 """
@@ -237,9 +240,6 @@ function model_symbols(this::AdaptiveDataModel)::UInt32
   this.data_symbols
 end
 
-"""
-Reset to equiprobable model
-"""
 function reset!(this::AdaptiveDataModel)
   iszero(this.data_symbols) && return this
   # restore probability estimates to uniform distribution
@@ -284,7 +284,7 @@ function update!(this::AdaptiveDataModel, from_encoder::Bool)
 
   # halve counts when a threshold is reached
   if (this.total_count += this.update_cycle) > (one(UInt32) << DM_LENGTH_SHIFT)
-    this.total_count = 0;
+    this.total_count = 0
     for n in 1:this.data_symbols
       this.total_count += (this.symbol_count[n] = (this.symbol_count[n] + 1) >> 1)
     end
@@ -331,100 +331,38 @@ end
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-export ArithmeticCodec, buffer, set_buffer!, start_encoder!, start_decoder!,
-  read_from_file!, stop_encoder!, write_to_file!, stop_decoder!, put_bit!,
-  get_bit!, put_bits!, get_bits!, encode!, decode!
-
 const AC_MIN_LENGTH::UInt32 = 0x01000000 # threshold for renormalization
 const AC_MAX_LENGTH::UInt32 = 0xFFFFFFFF # maximum AC interval length
 
-"""
-Encoder and decoder class
-
-Class with both the arithmetic encoder and decoder.  All compressed data is
-saved to a memory buffer
-"""
-mutable struct ArithmeticCodec
-
-  code_buffer::Vector{UInt8}
-  ac_index::Int
-
-  # arithmetic coding state
+mutable struct CodecState
   base::UInt32
   value::UInt32
   length::UInt32
-
-  buffer_size::UInt32
-  mode::UInt32 # mode: 0 = undef, 1 = encoder, 2 = decoder
-
-  ArithmeticCodec() = new(
-    UInt32[], 0,
-    ntuple(_ -> zero(UInt32), 3)...,
-    ntuple(_ -> zero(UInt32), 2)...,
-  )
-  ArithmeticCodec(args...) = set_buffer!(ArithmeticCodec(), args...)
-
 end
 
-function buffer(this::ArithmeticCodec)::Vector{UInt8}
-  this.code_buffer
+struct Encoder{T}
+  stream::T
+  state::CodecState
+  Encoder(stream::T) where {T<:IO} =
+    new{T}(stream, CodecState(zero(UInt32), zero(UInt32), AC_MAX_LENGTH))
 end
 
-function set_buffer!(
-    this::ArithmeticCodec,
-    max_code_bytes::UInt32,
-    user_buffer::Union{Nothing, Vector{UInt8}} = nothing, # `nothing` = assign new
-  )
+Encoder() = Encoder(IOBuffer())
+Encoder(filename::AbstractString) = Encoder(open(filename, "w"))
 
-  # test for reasonable sizes
-  16 <= max_code_bytes <= 0x1000000 || error("invalid codec buffer size")
-
-  iszero(this.mode) || error("cannot set buffer while encoding or decoding")
-
-  if !isnothing(user_buffer) # user provides memory buffer
-    this.buffer_size = max_code_bytes
-    this.code_buffer = user_buffer # set buffer for compressed data
-    return this
+struct Decoder{T}
+  stream::T
+  state::CodecState
+  function Decoder(stream::T) where {T<:IO}
+    value = ntoh(read(stream, UInt32))
+    new{T}(stream, CodecState(zero(UInt32), value, AC_MAX_LENGTH))
   end
-
-  max_code_bytes <= this.buffer_size && return # enough available
-
-  # assign new memory & set buffer for compressed data
-  this.buffer_size = max_code_bytes
-  this.code_buffer = zeros(UInt8, max_code_bytes + 16) # 16 extra bytes
-
-  this
 end
 
-function start_encoder!(this::ArithmeticCodec)
-  iszero(this.mode) || error("cannot start encoder")
-  iszero(this.buffer_size) && error("no code buffer set")
+Decoder(data::AbstractArray{UInt8}) = Decoder(IOBuffer(data))
+Decoder(filename::AbstractString) = Decoder(open(filename, "r"))
 
-  # initialize encoder variables: interval and pointer
-  this.mode = 1
-  this.base = 0
-  this.length = AC_MAX_LENGTH
-  this.ac_index = 1 # index of next data byte
-
-  this
-end
-
-function start_decoder!(this::ArithmeticCodec)
-  iszero(this.mode) || error("cannot start decoder")
-  iszero(this.buffer_size) && error("no code buffer set")
-
-  # initialize decoder: interval, index, initial code value
-  this.mode = 2;
-  this.length = AC_MAX_LENGTH
-  this.ac_index = 4
-  this.value = (
-    UInt32(this.code_buffer[1]) << 24 |
-    UInt32(this.code_buffer[2]) << 16 |
-    UInt32(this.code_buffer[3]) <<  8 |
-    UInt32(this.code_buffer[4])
-  )
-  this
-end
+struct ArithmeticCodec end # TODO: remove
 
 """
 Read code data, start decoder
@@ -434,27 +372,24 @@ function read_from_file!(this::ArithmeticCodec, code_file::IOStream)
   this
 end
 
-function stop_encoder!(this::ArithmeticCodec)::UInt32 # returns number of bytes used
-  this.mode == 1 || error("invalid to stop encoder")
-  this.mode = 0
+function finalize!(enc::Encoder{T}) where T
+  state = enc.state
 
-  init_base::UInt32 = this.base # done encoding: set final data bytes
+  init_base::UInt32 = state.base # done encoding: set final data bytes
 
-  if this.length > 2 * AC_MIN_LENGTH
-    this.base  += AC_MIN_LENGTH # base offset
-    this.length = AC_MIN_LENGTH >> 1 # set new length for 1 more byte
+  if state.length > 2 * AC_MIN_LENGTH
+    state.base  += AC_MIN_LENGTH # base offset
+    state.length = AC_MIN_LENGTH >> 1 # set new length for 1 more byte
   else
-    this.base  += AC_MIN_LENGTH >> 1 # base offset
-    this.length = AC_MIN_LENGTH >> 9 # set new length for 2 more bytes
+    state.base  += AC_MIN_LENGTH >> 1 # base offset
+    state.length = AC_MIN_LENGTH >> 9 # set new length for 2 more bytes
   end
 
-  init_base > this.base && propagate_carry!(this) # overflow = carry
+  propagate_carry!(enc, init_base) # overflow = carry
 
-  renorm_enc_interval!(this) # renormalization = output last bytes
+  renormalize_interval!(enc) # renormalization = output last bytes
 
-  code_bytes::UInt32 = UInt32(this.ac_index - 1)
-  code_bytes > this.buffer_size && error("code buffer overflow")
-  code_bytes # number of bytes used
+  T <: IOBuffer ? take!(seekstart(enc.stream)) : nothing
 end
 
 """
@@ -463,12 +398,6 @@ Stop encoder, write code data
 function write_to_file!(this::ArithmeticCodec, code_file::IOStream)::UInt32
   error("not implemented")
   zero(UInt32)
-end
-
-function stop_decoder!(this::ArithmeticCodec)
-  this.mode == 2 || error("invalid to stop decoder")
-  this.mode = 0
-  this
 end
 
 function put_bit!(this::ArithmeticCodec, bit::UInt32)
@@ -491,76 +420,66 @@ function get_bits!(this::ArithmeticCodec, number_of_bits::UInt32)::UInt32
   zero(UInt32)
 end
 
-function encode!(this::ArithmeticCodec, bit::UInt32, M::StaticBitModel)
-  DEBUG && this.mode != 1 && error("encoder not initialized")
+function encode!(enc::Encoder, bit::Integer, M::StaticBitModel)
 
-  x::UInt32 = M.bit_0_prob * (this.length >> BM_LENGTH_SHIFT) # product l x p0
+  x::UInt32 = M.bit_0_prob * (enc.state.length >> BM_LENGTH_SHIFT) # product l x p0
 
   # update interval
   if iszero(bit)
-    this.length = x
+    enc.state.length = x
   else
-    init_base::UInt32 = this.base
-    this.base   += x
-    this.length -= x
-    init_base > this.base && propagate_carry!(this) # overflow = carry
+    init_base::UInt32 = enc.state.base
+    enc.state.base   += x
+    enc.state.length -= x
+    propagate_carry!(enc, init_base) # overflow = carry
   end
 
-  this.length < AC_MIN_LENGTH && renorm_enc_interval!(this) # renormalization
-
-  this
+  renormalize_interval!(enc)
 end
 
-function decode!(this::ArithmeticCodec, M::StaticBitModel)::UInt32
-  DEBUG && this.mode != 2 && error("decoder not initialized")
-
-  x::UInt32 = M.bit_0_prob * (this.length >> BM_LENGTH_SHIFT) # product l x p0
-  bit::UInt32 = (this.value >= x) # decision
+function decode!(dec::Decoder, M::StaticBitModel)::Bool
+  x::UInt32 = M.bit_0_prob * (dec.state.length >> BM_LENGTH_SHIFT) # product l x p0
+  bit = (dec.state.value >= x) # decision
 
   # update & shift interval
-  if (bit == 0)
-    this.length = x
+  if bit
+    dec.state.value  -= x # shifted interval base = 0
+    dec.state.length -= x
   else
-    this.value  -= x # shifted interval base = 0
-    this.length -= x
+    dec.state.length = x
   end
 
-  this.length < AC_MIN_LENGTH && renorm_dec_interval!(this) # renormalization
+  renormalize_interval!(dec)
 
   bit # return data bit value
 end
 
-function encode!(this::ArithmeticCodec, data::UInt32, M::StaticDataModel)
-  DEBUG && this.mode != 1 &&error("encoder not initialized")
+function encode!(enc::Encoder, data::Integer, M::StaticDataModel)
   DEBUG && data >= M.data_symbols && error("invalid data symbol")
 
-  init_base::UInt32 = this.base
+  init_base::UInt32 = enc.state.base
 
   # compute products
   if (data == M.last_symbol)
-    x = M.distribution[data + 1] * (this.length >> DM_LENGTH_SHIFT)
-    this.base   += x # update interval
-    this.length -= x # no product needed
+    x = M.distribution[data + 1] * (enc.state.length >> DM_LENGTH_SHIFT)
+    enc.state.base   += x # update interval
+    enc.state.length -= x # no product needed
   else
-    x = M.distribution[data + 1] * (this.length >>= DM_LENGTH_SHIFT)
-    this.base   += x # update interval
-    this.length  = M.distribution[data + 2] * this.length - x
+    x = M.distribution[data + 1] * (enc.state.length >>= DM_LENGTH_SHIFT)
+    enc.state.base   += x # update interval
+    enc.state.length  = M.distribution[data + 2] * enc.state.length - x
   end
 
-  init_base > this.base && propagate_carry!(this) # overflow = carry
-  this.length < AC_MIN_LENGTH && renorm_enc_interval!(this) # renormalization
-
-  this
+  propagate_carry!(enc, init_base) # overflow = carry
+  renormalize_interval!(enc)
 end
 
-function decode!(this::ArithmeticCodec, M::StaticDataModel)::UInt32
-  DEBUG && this.mode != 2 && error("decoder not initialized")
-
-  y::UInt32 = this.length
+function decode!(dec::Decoder, M::StaticDataModel)::UInt32
+  y::UInt32 = dec.state.length
 
   if !isempty(M.decoder_table) # use table look-up for faster decoding
 
-    dv::UInt32 = div(this.value, (this.length >>= DM_LENGTH_SHIFT))
+    dv::UInt32 = div(dec.state.value, (dec.state.length >>= DM_LENGTH_SHIFT))
     t::UInt32 = dv >> M.table_shift
 
     s::UInt32 = M.decoder_table[t + 1] # initial decision based on table look-up
@@ -576,21 +495,21 @@ function decode!(this::ArithmeticCodec, M::StaticDataModel)::UInt32
     end
 
     # compute products
-    x::UInt32 = M.distribution[s + 1] * this.length
+    x::UInt32 = M.distribution[s + 1] * dec.state.length
     if s != M.last_symbol
-      y = M.distribution[s + 2] * this.length
+      y = M.distribution[s + 2] * dec.state.length
     end
 
   else # decode using only multiplications
 
     x = s = 0
-    this.length >>= DM_LENGTH_SHIFT
+    dec.state.length >>= DM_LENGTH_SHIFT
     m = (n = M.data_symbols) >> 1
 
     # decode via bisection search
     while true
-      z::UInt32 = this.length * M.distribution[m + 1]
-      if (z > this.value) # value is smaller
+      z::UInt32 = dec.state.length * M.distribution[m + 1]
+      if (z > dec.state.value) # value is smaller
         n = m
         y = z
       else # value is larger or equal
@@ -602,94 +521,84 @@ function decode!(this::ArithmeticCodec, M::StaticDataModel)::UInt32
   end
 
   # update interval
-  this.value -= x
-  this.length = y - x;
+  dec.state.value -= x
+  dec.state.length = y - x
 
-  this.length < AC_MIN_LENGTH && renorm_dec_interval!(this) # renormalization
+  renormalize_interval!(dec)
 
   s
 end
 
-function encode!(this::ArithmeticCodec, bit::UInt32, M::AdaptiveBitModel)
-  DEBUG && this.mode != 1 && error("encoder not initialized")
-
-  x::UInt32 = M.bit_0_prob * (this.length >> BM_LENGTH_SHIFT) # product l x p0
+function encode!(enc::Encoder, bit::Integer, M::AdaptiveBitModel)
+  x::UInt32 = M.bit_0_prob * (enc.state.length >> BM_LENGTH_SHIFT) # product l x p0
 
   # update interval
   if iszero(bit)
-    this.length = x
+    enc.state.length = x
     M.bit_0_count += 1
   else
-    init_base::UInt32 = this.base
-    this.base   += x
-    this.length -= x
-    init_base > this.base && propagate_carry!(this) # overflow = carry
+    init_base::UInt32 = enc.state.base
+    enc.state.base   += x
+    enc.state.length -= x
+    propagate_carry!(enc, init_base) # overflow = carry
   end
 
-  this.length < AC_MIN_LENGTH && renorm_enc_interval!(this) # renormalization
-
+  renormalize_interval!(enc)
   iszero(M.bits_until_update -= 1) && update!(M) # periodic model update
 
-  this
+  enc
 end
 
-function decode!(this::ArithmeticCodec, M::AdaptiveBitModel)::UInt32
-  DEBUG && this.mode != 2 && error("decoder not initialized")
-
-  x::UInt32 = M.bit_0_prob * (this.length >> BM_LENGTH_SHIFT) # product l x p0
-  bit::UInt32 = (this.value >= x) # decision
+function decode!(dec::Decoder, M::AdaptiveBitModel)::Bool
+  x::UInt32 = M.bit_0_prob * (dec.state.length >> BM_LENGTH_SHIFT) # product l x p0
+  bit = (dec.state.value >= x) # decision
 
   # update interval
-  if iszero(bit)
-    this.length = x
-    M.bit_0_count += 1
+  if bit
+    dec.state.value  -= x
+    dec.state.length -= x
   else
-    this.value  -= x
-    this.length -= x
+    dec.state.length = x
+    M.bit_0_count += 1
   end
 
-  this.length < AC_MIN_LENGTH && renorm_dec_interval!(this) # renormalization
-
+  renormalize_interval!(dec)
   iszero(M.bits_until_update -= 1) && update!(M) # periodic model update
 
   bit # return data bit value
 end
 
-function encode!(this::ArithmeticCodec, data::UInt32, M::AdaptiveDataModel)
-  DEBUG && this.mode != 1 && error("encoder not initialized")
-  DEBUG && data >= M.data_symbols && error("invalid data symbol")
+function encode!(enc::Encoder, data::Integer, M::AdaptiveDataModel)
+  DEBUG && (0 <= data < M.data_symbols || error("invalid data symbol"))
 
-  init_base::UInt32 = this.base
+  init_base::UInt32 = enc.state.base
 
   # compute products
   if data == M.last_symbol
-    x::UInt32 = M.distribution[data + 1] * (this.length >> DM_LENGTH_SHIFT)
-    this.base   += x # update interval
-    this.length -= x # no product needed
+    x::UInt32 = M.distribution[data + 1] * (enc.state.length >> DM_LENGTH_SHIFT)
+    enc.state.base   += x # update interval
+    enc.state.length -= x # no product needed
   else
-    x = M.distribution[data + 1] * (this.length >>= DM_LENGTH_SHIFT)
-    this.base   += x # update interval
-    this.length  = M.distribution[data + 2] * this.length - x
+    x = M.distribution[data + 1] * (enc.state.length >>= DM_LENGTH_SHIFT)
+    enc.state.base   += x # update interval
+    enc.state.length  = M.distribution[data + 2] * enc.state.length - x
   end
 
-  init_base > this.base && propagate_carry!(this) # overflow = carry
-
-  this.length < AC_MIN_LENGTH && renorm_enc_interval!(this) # renormalization
+  propagate_carry!(enc, init_base) # overflow = carry
+  renormalize_interval!(enc)
 
   M.symbol_count[data + 1] += 1
   iszero(M.symbols_until_update -= 1) && update!(M, true) # periodic model update
 
-  this
+  enc
 end
 
-function decode!(this::ArithmeticCodec, M::AdaptiveDataModel)::UInt32
-  DEBUG && this.mode != 2 && error("decoder not initialized")
-
-  y::UInt32 = this.length
+function decode!(dec::Decoder, M::AdaptiveDataModel)::UInt32
+  y::UInt32 = dec.state.length
 
   if !isempty(M.decoder_table) # use table look-up for faster decoding
 
-    dv::UInt32 = div(this.value, (this.length >>= DM_LENGTH_SHIFT))
+    dv::UInt32 = div(dec.state.value, (dec.state.length >>= DM_LENGTH_SHIFT))
     t::UInt32 = dv >> M.table_shift
 
     # initial decision based on table look-up
@@ -706,21 +615,21 @@ function decode!(this::ArithmeticCodec, M::AdaptiveDataModel)::UInt32
     end
 
     # compute products
-    x::UInt32 = M.distribution[s + 1] * this.length
+    x::UInt32 = M.distribution[s + 1] * dec.state.length
     if s != M.last_symbol
-      y = M.distribution[s + 2] * this.length
+      y = M.distribution[s + 2] * dec.state.length
     end
 
   else # decode using only multiplications
 
     x = s = zero(UInt32)
-    this.length >>= DM_LENGTH_SHIFT
+    dec.state.length >>= DM_LENGTH_SHIFT
     m = (n = M.data_symbols) >> 1
 
     # decode via bisection search
     while true
-      z::UInt32 = this.length * M.distribution[m + 1]
-      if (z > this.value) # value is smaller
+      z::UInt32 = dec.state.length * M.distribution[m + 1]
+      if (z > dec.state.value) # value is smaller
         n = m
         y = z
       else # value is larger or equal
@@ -731,47 +640,50 @@ function decode!(this::ArithmeticCodec, M::AdaptiveDataModel)::UInt32
     end
   end
 
-  this.value -= x # update interval
-  this.length = y - x
+  dec.state.value -= x # update interval
+  dec.state.length = y - x
 
-  this.length < AC_MIN_LENGTH && renorm_dec_interval!(this) # renormalization
+  renormalize_interval!(dec)
 
   M.symbol_count[s + 1] += 1
   iszero(M.symbols_until_update -= 1) && update!(M, false) # periodic model update
 
-  return s;
+  return s
 end
 
-function propagate_carry!(this::ArithmeticCodec)
+function propagate_carry!(enc::Encoder, init_base)
+  init_base > enc.state.base || return enc
   # carry propagation on compressed data buffer
-  p = this.ac_index - 1
-  while this.code_buffer[p] == 0xff
-    this.code_buffer[p] = 0
-    p -= 1
+  io = enc.stream
+  mark(io)
+  while read(skip(io, -1), UInt8) == 0xff
+    write(skip(io, -1), 0x0)
+    skip(io, -1)
   end
-  this.code_buffer[p] += 1
-  this
+  final_val = read(skip(io, -1), UInt8)
+  write(skip(io, -1), final_val + 0x1)
+  reset(io)
+  enc
 end
 
-function renorm_enc_interval!(this::ArithmeticCodec)
+@inline function renormalize_interval!(enc::Encoder)
   # output and discard top byte
-  while true
-    this.code_buffer[this.ac_index] = UInt8(this.base >> 24)
-    this.ac_index += 1
-    this.base <<= 8
-    (this.length <<= 8) < AC_MIN_LENGTH || break # length multiplied by 256
+  while enc.state.length < AC_MIN_LENGTH
+    write(enc.stream, UInt8(enc.state.base >> 24))
+    enc.state.base <<= 8
+    enc.state.length <<= 8
   end
-  this
+  enc
 end
 
-function renorm_dec_interval!(this::ArithmeticCodec)
-  # read least-significant byte
-  while true
-    this.ac_index += 1
-    this.value = (this.value << 8) | this.code_buffer[this.ac_index]
-    (this.length <<= 8) < AC_MIN_LENGTH || break # length multiplied by 256
+function renormalize_interval!(dec::Decoder)
+  while dec.state.length < AC_MIN_LENGTH
+    # read least-significant byte
+    lsb = eof(dec.stream) ? 0x0 : read(dec.stream, UInt8)
+    dec.state.value = (dec.state.value << 8) | lsb
+    dec.state.length <<= 8 # length multiplied by 256
   end
-  this
+  dec
 end
 
 end # module FastAC

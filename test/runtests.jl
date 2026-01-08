@@ -44,14 +44,12 @@ function reference_benchmark(data_symbols, test_cycles = 10; verbose = false)
   if data_symbols == 2
     T = UInt8
     src = RandomData.RandomBitSource()
-    codec = ArithmeticCodec(SIMUL_TESTS >> 2)
     static_model = StaticBitModel()
     adaptive_model = AdaptiveBitModel()
   else
     # could use UInt8 when <=256, but keeping it the same as the C++ code for now
     T = UInt16
     src = RandomData.RandomDataSource()
-    codec = ArithmeticCodec(SIMUL_TESTS << 1)
     static_model = StaticDataModel()
     adaptive_model = AdaptiveDataModel(UInt32(data_symbols))
   end
@@ -94,21 +92,21 @@ function reference_benchmark(data_symbols, test_cycles = 10; verbose = false)
           end
 
           # encode data buffer
-          start_encoder!(codec)
+          enc = Encoder()
           start_time = time()
-          foreach(x -> encode!(codec, UInt32(x), model), source_data)
+          foreach(x -> encode!(enc, x, model), source_data)
           test_cycles > 1 && (encode_time += time() - start_time)
-          code_bits += 8 * stop_encoder!(codec)
+          encoded_data = finalize!(enc)
+          code_bits += 8 * length(encoded_data)
 
           # start with fresh distribution for decoding
           model isa Union{AdaptiveBitModel,AdaptiveDataModel} && reset!(model)
 
           # decode data buffer
-          start_decoder!(codec)
+          dec = Decoder(encoded_data)
           start_time = time()
-          foreach(ind -> decoded_data[ind] = decode!(codec, model), eachindex(decoded_data))
+          foreach(ind -> decoded_data[ind] = decode!(dec, model), eachindex(decoded_data))
           test_cycles > 1 && (decode_time += time() - start_time)
-          stop_decoder!(codec)
 
           # check for decoding errors
           @test source_data == decoded_data
