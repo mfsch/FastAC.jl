@@ -1,3 +1,7 @@
+# This file contains recipes for the `just` command runner.
+# See https://github.com/casey/just for more information.
+set positional-arguments
+
 _default:
   @just --list
 

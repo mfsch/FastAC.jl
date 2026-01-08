@@ -171,16 +171,18 @@ end
 @testset "FastAC.jl Tests" verbose = true begin
   @testset "Tests from C++ reference code" verbose=true begin
 
-    cycles = 2
+    cycles_arg = get(filter(startswith("--cycles="), ARGS), 1, "--cycles=5")
+    cycles = parse(Int, split(cycles_arg, '=')[end])
+    verbose = "-v" in ARGS || "--verbose" in ARGS
 
     # test binary compression (two symbols)
-    reference_benchmark(2, cycles; verbose = true)
+    reference_benchmark(2, cycles; verbose)
 
     # test data compression with <=16 symbols (table is not used)
-    reference_benchmark(10, cycles; verbose = true)
+    reference_benchmark(10, cycles; verbose)
 
     # test data compression with >16 symbols (table is used)
-    reference_benchmark(20, cycles; verbose = true)
+    reference_benchmark(20, cycles; verbose)
   end
 
   @testset "Encoding raw bits without model" begin
