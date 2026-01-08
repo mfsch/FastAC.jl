@@ -126,16 +126,62 @@ function reference_benchmark(data_symbols, test_cycles = 10; verbose = false)
   end
 end
 
-@testset "Tests from C++ reference code" verbose=true begin
+function test_raw(n)
+  bits = rand(Bool, n)
+  bytes = rand(UInt8, n)
+  shorts = rand(UInt16, n)
+  vals = [rand(0:2047) for _ in 1:n] # 11-bit values
 
-  cycles = 2
+  enc = Encoder()
+  for ind in 1:n
+    encode!(enc, bits[ind])
+    encode!(enc, bytes[ind])
+    encode!(enc, shorts[ind])
+    encode!(enc, vals[ind], 11)
+  end
+  encoded = finalize!(enc)
 
-  # test binary compression (two symbols)
-  reference_benchmark(2, cycles; verbose = true)
+  decoded_bits = Bool[]
+  decoded_bytes = UInt8[]
+  decoded_shorts = UInt16[]
+  decoded_vals = []
 
-  # test data compression with <=16 symbols (table is not used)
-  reference_benchmark(10, cycles; verbose = true)
+  dec = Decoder(encoded)
+  for _ in 1:n
+    push!(decoded_bits, decode!(dec, Bool))
+    push!(decoded_bytes, decode!(dec, UInt8))
+    push!(decoded_shorts, decode!(dec, UInt16))
+    push!(decoded_vals, decode!(dec, 11))
+  end
 
-  # test data compression with >16 symbols (table is used)
-  reference_benchmark(20, cycles; verbose = true)
+  @test bits == decoded_bits
+  @test bytes == decoded_bytes
+  @test shorts == decoded_shorts
+  @test vals == decoded_vals
+
+  # redundancy should be very small since there is no randomness
+  expected_bits = n * (1 + 8 + 16 + 11)
+  actual_bits = length(encoded) * 8
+  redundancy = (actual_bits - expected_bits) / expected_bits * 100
+  @test redundancy < 0.1
+end
+
+@testset "FastAC.jl Tests" verbose = true begin
+  @testset "Tests from C++ reference code" verbose=true begin
+
+    cycles = 2
+
+    # test binary compression (two symbols)
+    reference_benchmark(2, cycles; verbose = true)
+
+    # test data compression with <=16 symbols (table is not used)
+    reference_benchmark(10, cycles; verbose = true)
+
+    # test data compression with >16 symbols (table is used)
+    reference_benchmark(20, cycles; verbose = true)
+  end
+
+  @testset "Encoding raw bits without model" begin
+    test_raw(100_000)
+  end
 end

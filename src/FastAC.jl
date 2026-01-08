@@ -400,25 +400,49 @@ function write_to_file!(this::ArithmeticCodec, code_file::IOStream)::UInt32
   zero(UInt32)
 end
 
-function put_bit!(this::ArithmeticCodec, bit::UInt32)
-  error("not implemented")
-  this
+function encode!(enc::Encoder, data::T, number_of_bits::Integer = 8 * sizeof(T)) where {T<:Integer}
+  @boundscheck begin
+    1 <= number_of_bits <= 20 || error("invalid number of bits")
+    data < (1 << number_of_bits) || error("invalid data")
+  end
+  init_base = enc.state.base
+  enc.state.base += UInt32(data) * (enc.state.length >>= number_of_bits) # new interval base and length
+  propagate_carry!(enc, init_base) # overflow = carry
+  renormalize_interval!(enc)
 end
 
-function get_bit!(this::ArithmeticCodec)::UInt32
-  error("not implemented")
-  zero(UInt32)
+function encode!(enc::Encoder, bit::Bool)
+  enc.state.length >>= 1 # halve interval
+  if bit
+    init_base = enc.state.base
+    enc.state.base += enc.state.length # move base
+    propagate_carry!(enc, init_base) # overflow = carry
+  end
+  renormalize_interval!(enc)
 end
 
-function put_bits!(this::ArithmeticCodec, data::UInt32, number_of_bits::UInt32)
-  error("not implemented")
-  this
+function decode!(dec::Decoder, ::Type{Bool})::Bool
+  dec.state.length >>= 1 # halve interval
+  bit = (dec.state.value >= dec.state.length) # decode bit
+  bit && (dec.state.value -= dec.state.length) # move base
+  renormalize_interval!(dec)
+  bit # return data bit value
 end
 
-function get_bits!(this::ArithmeticCodec, number_of_bits::UInt32)::UInt32
-  error("not implemented")
-  zero(UInt32)
+function decode!(dec::Decoder, ::Type{UInt32}, number_of_bits::Integer)::UInt32
+  @boundscheck 1 <= number_of_bits <= 20 || error("invalid number of bits")
+  s::UInt32 = div(dec.state.value, (dec.state.length >>= number_of_bits)) # decode symbol, change length
+  dec.state.value -= dec.state.length * s # update interval
+  renormalize_interval!(dec)
+  s
 end
+
+# allow reading bits into a specific integer type
+decode!(dec::Decoder, ::Type{T}, number_of_bits::Integer = 8 * sizeof(T)) where {T<:Integer} =
+  convert(T, decode!(dec, UInt32, number_of_bits))
+
+# by default, return bits as an `Int`
+decode!(dec::Decoder, number_of_bits::Integer) = decode!(dec, Int, number_of_bits)
 
 function encode!(enc::Encoder, bit::Integer, M::StaticBitModel)
 
